@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from rdbms.buffer import BufferPool, BufferPoolManager
+from rdbms.buffer import BufferPool, BufferPoolManager, NoFreeBuffer
 from rdbms.disk import DiskManager
 
 
@@ -36,7 +36,6 @@ def test_buffer_pool_manager_basic_operations(
     buffer_pool_manager.unpin_page(page2_id)
 
 
-@pytest.mark.xfail
 def test_buffer_pool_manager_eviction(
     buffer_pool_manager: BufferPoolManager, sample_pages: tuple[bytearray, bytearray]
 ):
@@ -54,8 +53,10 @@ def test_buffer_pool_manager_eviction(
     buffer2 = buffer_pool_manager.create_page()
     buffer2.page_content = world
 
-    # 1つ目のページを再度フェッチして内容を確認
-    buffer1 = buffer_pool_manager.fetch_page(page1_id)
+    with pytest.raises(NoFreeBuffer):
+        # 1つ目のページを再度フェッチして内容を確認(失敗する)
+        buffer1 = buffer_pool_manager.fetch_page(page1_id)
+
     assert bytes(buffer1.page) == bytes(hello)
 
 
