@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from rdbms.disk import PAGE_SIZE, DiskManager, PageId
+from rdbms.storage.disk import PAGE_SIZE, DiskManager, PageId
 
 
 class BufferPoolError(Exception):
