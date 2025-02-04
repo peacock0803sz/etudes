@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from rdbms.buffer import BufferPool, BufferPoolManager, NoFreeBuffer
-from rdbms.disk import DiskManager
+from rdbms.storage.buffer import BufferPool, BufferPoolManager, NoFreeBuffer
+from rdbms.storage.disk import DiskManager
 
 
 def test_buffer_pool_manager_basic_operations(

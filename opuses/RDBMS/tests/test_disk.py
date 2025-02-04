@@ -1,4 +1,4 @@
-from rdbms.disk import PAGE_SIZE, DiskManager
+from rdbms.storage.disk import PAGE_SIZE, DiskManager
 
 
 def test_disk_manager_basic_operations(

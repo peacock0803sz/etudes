@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from rdbms.buffer import BufferPool, BufferPoolManager
-from rdbms.disk import PAGE_SIZE, DiskManager
+from rdbms.storage.buffer import BufferPool, BufferPoolManager
+from rdbms.storage.disk import PAGE_SIZE, DiskManager
 
 
 @pytest.fixture
