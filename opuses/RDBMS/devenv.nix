@@ -1,12 +1,13 @@
 { pkgs, lib, config, inputs, ... }:
 
 {
+  cachix.enable = false;
   # https://devenv.sh/basics/
   env.GREET = "etudes.RDBMS";
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
-    git 
+    git
   ];
 
   # https://devenv.sh/languages/
