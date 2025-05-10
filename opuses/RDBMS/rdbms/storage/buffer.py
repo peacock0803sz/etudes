@@ -1,170 +1,247 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from rdbms.storage.disk import PAGE_SIZE, DiskManager, PageId
-
-
-class BufferPoolError(Exception):
-    pass
+from rdbms.storage.disk import BlockId, FileMgr, Page
 
 
-class NoFreeBuffer(BufferPoolError):
+@dataclass
+class LogMgr:
+    fm: "FileMgr"
+    logfile: str
+    logpage: Page = None
+    current_blk: BlockId = None
+    latest_lsn: int = 0
+    last_saved_lsn: int = 0
+
+    def __post_init__(self):
+        self.logpage = Page(block_size=self.fm.block_size())
+        logsize = self.fm.length(self.logfile)
+        if logsize == 0:
+            self.current_blk = self._append_new_block()
+        else:
+            self.current_blk = BlockId(self.logfile, logsize - 1)
+            self.fm.read(self.current_blk, self.logpage)
+
+    def flush(self, lsn: int) -> None:
+        if lsn >= self.last_saved_lsn:
+            self._flush()
+
+    def iterator(self) -> "LogIterator":
+        self._flush()
+        return LogIterator(self.fm, self.current_blk)
+
+    def append(self, logrec: bytes) -> int:
+        boundary = self.logpage.get_int(0)
+        recsize = len(logrec)
+        bytesneeded = recsize + 4  # 4はInteger.BYTESに相当
+
+        if boundary - bytesneeded < 4:  # 収まらない場合
+            self._flush()  # 次のブロックに移動
+            self.current_blk = self._append_new_block()
+            boundary = self.logpage.get_int(0)
+
+        recpos = boundary - bytesneeded
+        self.logpage.set_bytes(recpos, logrec)
+        self.logpage.set_int(0, recpos)  # 新しい境界
+        self.latest_lsn += 1
+        return self.latest_lsn
+
+    def _append_new_block(self) -> BlockId:
+        blk = self.fm.append(self.logfile)
+        self.logpage.set_int(0, self.fm.block_size())
+        self.fm.write(blk, self.logpage)
+        return blk
+
+    def _flush(self) -> None:
+        self.fm.write(self.current_blk, self.logpage)
+        self.last_saved_lsn = self.latest_lsn
+
+
+class LogIterator:
+    def __init__(self, fm: "FileMgr", blk: BlockId):
+        self.fm = fm
+        self.blk = blk
+        self.p = Page(block_size=fm.block_size())
+        self._move_to_block(blk)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.has_next():
+            raise StopIteration
+
+        if self.current_pos == self.fm.block_size():
+            self.blk = BlockId(self.blk.file_name, self.blk.number - 1)
+            self._move_to_block(self.blk)
+
+        rec = self.p.get_bytes(self.current_pos)
+        self.current_pos += 4 + len(rec)  # 4はInteger.BYTESに相当
+        return rec
+
+    def has_next(self) -> bool:
+        return self.current_pos < self.fm.block_size() or self.blk.number > 0
+
+    def _move_to_block(self, blk: BlockId) -> None:
+        self.fm.read(blk, self.p)
+        self.boundary = self.p.get_int(0)
+        self.current_pos = self.boundary
+
+
+@dataclass
+class Buffer:
+    fm: "FileMgr"
+    lm: "LogMgr"
+    contents: Page = None
+    blk: BlockId = None
+    pins: int = 0
+    txnum: int = -1
+    lsn: int = -1
+
+    def __post_init__(self):
+        self.contents = Page(block_size=self.fm.block_size())
+
+    def block(self) -> BlockId:
+        return self.blk
+
+    def is_pinned(self) -> bool:
+        return self.pins > 0
+
+    def modifying_tx(self) -> int:
+        return self.txnum
+
+    def set_modified(self, txnum: int, lsn: int) -> None:
+        self.txnum = txnum
+        if lsn >= 0:
+            self.lsn = lsn
+
+    def pin(self) -> None:
+        self.pins += 1
+
+    def unpin(self) -> None:
+        self.pins -= 1
+
+    def assign_to_block(self, b: BlockId) -> None:
+        self.flush()
+        self.blk = b
+        self.fm.read(self.blk, self.contents)
+        self.pins = 0
+
+    def flush(self) -> None:
+        if self.txnum >= 0:
+            self.lm.flush(self.lsn)
+            self.fm.write(self.blk, self.contents)
+            self.txnum = -1
+
+
+class BufferAbortException(Exception):
     pass
 
 
 @dataclass
-class BufferId:
-    value: int = 0
+class BufferMgr:
+    fm: "FileMgr"
+    lm: "LogMgr"
+    numbuffs: int
+    bufferpool: list[Buffer] = None
+    num_available: int = 0
+    MAX_TIME: int = 10000  # 10秒
 
-    def __eq__(self, other):
-        if isinstance(other, BufferId):
-            return self.value == other.value
-        return False
+    def __post_init__(self):
+        self.bufferpool = []
+        self.num_available = self.numbuffs
+        for i in range(self.numbuffs):
+            self.bufferpool.append(Buffer(self.fm, self.lm))
 
-    def __hash__(self):
-        return hash(self.value)
+    def available(self) -> int:
+        return self.num_available
+
+    def flush_all(self, txnum: int) -> None:
+        for buff in self.bufferpool:
+            if buff.modifying_tx() == txnum:
+                buff.flush()
+
+    def unpin(self, buff: Buffer) -> None:
+        buff.unpin()
+        if not buff.is_pinned():
+            self.num_available += 1
+            # JavaのnotifyAll()に相当するコードはPythonでは異なる実装が必要
+            # ここではシンプルな実装のため省略
+
+    def pin(self, blk: BlockId) -> Buffer:
+        import time
+
+        timestamp = time.time() * 1000  # ミリ秒に変換
+
+        buff = self._try_to_pin(blk)
+        while buff is None and not self._waiting_too_long(timestamp):
+            # Javaのwait()に相当するコードはPythonでは異なる実装が必要
+            # ここではシンプルに時間をチェックする
+            time.sleep(0.1)  # 100ミリ秒待機
+            buff = self._try_to_pin(blk)
+
+        if buff is None:
+            raise BufferAbortException()
+
+        return buff
+
+    def _waiting_too_long(self, starttime: int) -> bool:
+        import time
+
+        return (time.time() * 1000) - starttime > self.MAX_TIME
+
+    def _try_to_pin(self, blk: BlockId) -> Buffer | None:
+        buff = self._find_existing_buffer(blk)
+        if buff is None:
+            buff = self._choose_unpinned_buffer()
+            if buff is None:
+                return None
+            buff.assign_to_block(blk)
+
+        if not buff.is_pinned():
+            self.num_available -= 1
+
+        buff.pin()
+        return buff
+
+    def _find_existing_buffer(self, blk: BlockId) -> Buffer | None:
+        for buff in self.bufferpool:
+            b = buff.block()
+            if b is not None and b == blk:
+                return buff
+        return None
+
+    def _choose_unpinned_buffer(self) -> Buffer | None:
+        for buff in self.bufferpool:
+            if not buff.is_pinned():
+                return buff
+        return None
 
 
-class Buffer:
-    def __init__(self):
-        self.page_id = PageId.default()
-        self.page = bytearray(PAGE_SIZE)
-        self.is_dirty = False
+# BufferListクラス
+@dataclass
+class BufferList:
+    bm: "BufferMgr"
+    buffers: dict[BlockId, Buffer] = field(default_factory=dict)
+    pins: list[BlockId] = field(default_factory=list)
 
-    @property
-    def page_content(self):
-        return self.page
+    def get_buffer(self, blk: BlockId) -> Buffer:
+        return self.buffers.get(blk)
 
-    @page_content.setter
-    def page_content(self, content):
-        self.page[:] = content
+    def pin(self, blk: BlockId) -> None:
+        buff = self.bm.pin(blk)
+        self.buffers[blk] = buff
+        self.pins.append(blk)
 
+    def unpin(self, blk: BlockId) -> None:
+        buff = self.buffers.get(blk)
+        self.bm.unpin(buff)
+        self.pins.remove(blk)
+        if blk not in self.pins:
+            del self.buffers[blk]
 
-class Frame:
-    def __init__(self):
-        self.usage_count: int = 0
-        self.buffer: Buffer = Buffer()
-        self.pin_count: int = 0
-
-    @property
-    def is_pinned(self) -> bool:
-        return self.pin_count > 0
-
-
-class BufferPool:
-    def __init__(self, pool_size: int):
-        self.buffers = [Frame() for _ in range(pool_size)]
-        self.next_victim_id = BufferId(0)
-
-    def size(self):
-        return len(self.buffers)
-
-    def evict(self):
-        pool_size = self.size()
-        consecutive_pinned = 0
-
-        while True:
-            next_victim_id = self.next_victim_id
-            frame = self.buffers[next_victim_id.value]
-
-            if frame.usage_count == 0 and not frame.is_pinned:
-                return self.next_victim_id
-
-            if not frame.is_pinned:
-                frame.usage_count -= 1
-                consecutive_pinned = 0
-            else:
-                consecutive_pinned += 1
-                if consecutive_pinned >= pool_size:
-                    return None
-
-            self.next_victim_id = self.increment_id(self.next_victim_id)
-
-    def increment_id(self, buffer_id: BufferId) -> BufferId:
-        return BufferId((buffer_id.value + 1) % self.size())
-
-    def get_frame(self, buffer_id: BufferId) -> Frame:
-        return self.buffers[buffer_id.value]
-
-
-class BufferPoolManager:
-    def __init__(self, disk: DiskManager, pool: BufferPool):
-        self.disk = disk
-        self.pool = pool
-        self.page_table: dict[int, BufferId] = {}
-
-    def fetch_page(self, page_id: PageId):
-        # ページがすでにバッファプールにある場合
-        if page_id.value in self.page_table:
-            buffer_id = self.page_table[page_id.value]
-            frame = self.pool.get_frame(buffer_id)
-            frame.usage_count += 1
-            frame.pin_count += 1
-            return frame.buffer
-
-        # 新しいバッファを確保
-        buffer_id = self.pool.evict()
-        if buffer_id is None:
-            raise NoFreeBuffer("No free buffer available in buffer pool")
-
-        frame = self.pool.get_frame(buffer_id)
-        evict_page_id = frame.buffer.page_id
-
-        # 古いページが dirty な場合は書き出す
-        if frame.buffer.is_dirty:
-            self.disk.write_page_data(evict_page_id, frame.buffer.page)
-
-        # 新しいページを読み込む
-        frame.buffer.page_id = page_id
-        frame.buffer.is_dirty = False
-        self.disk.read_page_data(page_id, frame.buffer.page)
-        frame.usage_count = 1
-        frame.pin_count = 1
-
-        # ページテーブルを更新
-        if evict_page_id.value in self.page_table:
-            del self.page_table[evict_page_id.value]
-        self.page_table[page_id.value] = buffer_id
-
-        return frame.buffer
-
-    def create_page(self):
-        buffer_id = self.pool.evict()
-        if buffer_id is None:
-            raise NoFreeBuffer("No free buffer available in buffer pool")
-
-        frame = self.pool.get_frame(buffer_id)
-        evict_page_id = frame.buffer.page_id
-
-        # 古いページが dirty な場合は書き出す
-        if frame.buffer.is_dirty:
-            self.disk.write_page_data(evict_page_id, frame.buffer.page)
-
-        # 新しいページを作成
-        page_id = self.disk.allocate_page()
-        frame.buffer = Buffer()
-        frame.buffer.page_id = page_id
-        frame.buffer.is_dirty = True
-        frame.usage_count = 1
-        frame.pin_count = 1
-
-        # ページテーブルを更新
-        if evict_page_id.value in self.page_table:
-            del self.page_table[evict_page_id.value]
-        self.page_table[page_id.value] = buffer_id
-
-        return frame.buffer
-
-    def flush(self):
-        for page_id, buffer_id in self.page_table.items():
-            frame = self.pool.get_frame(buffer_id)
-            if frame.buffer.is_dirty:
-                self.disk.write_page_data(PageId(page_id), frame.buffer.page)
-                frame.buffer.is_dirty = False
-        self.disk.sync()
-
-    def unpin_page(self, page_id: PageId):
-        if page_id.value in self.page_table:
-            buffer_id = self.page_table[page_id.value]
-            frame = self.pool.get_frame(buffer_id)
-            if frame.pin_count > 0:
-                frame.pin_count -= 1
+    def unpin_all(self) -> None:
+        for blk in self.pins:
+            buff = self.buffers.get(blk)
+            self.bm.unpin(buff)
+        self.buffers.clear()
+        self.pins.clear()
