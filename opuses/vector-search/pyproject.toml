@@ -1,0 +1,30 @@
+[project]
+name = "vector-search"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.4",
+    "numpy>=2.4.6",
+    "sentence-transformers>=5.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
+    "ty>=0.0.26",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"__future__.annotations" = {msg = "Python 3.14+ uses PEP 649 for deferred evaluation of annotations. Do not use PEP 563."}
+
+[tool.uv]
+exclude-newer = "P3D"
+
+[tool.ty.rules]
+possibly-unresolved-reference = "ignore"
