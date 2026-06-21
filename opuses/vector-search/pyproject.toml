@@ -8,6 +8,7 @@ dependencies = [
     "duckdb>=1.5.4",
     "numpy>=2.4.6",
     "sentence-transformers>=5.6.0",
+    "torch",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,14 @@ select = ["E", "F", "I", "UP", "TID251"]
 
 [tool.uv]
 exclude-newer = "P3D"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
 
 [tool.ty.rules]
 possibly-unresolved-reference = "ignore"
